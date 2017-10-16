@@ -24,7 +24,7 @@ tcsplitter --payload 10000 \
 ```
 
 ## Flow
-
+![flow](https://github.com/untoreh/tcsplitter/raw/master/flow.png)
 
 ## Dependencies 
 

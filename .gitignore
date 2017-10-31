@@ -1,10 +1,13 @@
-./server
-./tcsplitter-arm
-./main
-./debug
-./pool/
-./chunkreader/
-./bak/
+server
+tcsplitter-arm
+tcsplitter_arm
+main
+debug
+pool/
+chunkreader/
+bak/
+out/*
+.vscode/
 
 # Created by https://www.gitignore.io/api/go
 

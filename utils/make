@@ -1,0 +1,17 @@
+#!/bin/sh -x
+
+REMOTE_USER=root
+REMOTE_IP=212.237.6.194
+REMOTE_PATH=/root/tcsplitter
+ANDROID=true ## push to phone
+ANDROID_PATH=/data/alpine/tcsplitter
+
+go build -o out/tcsplitter_amd64 server.go
+scp -r out/tcsplitter_amd64 $REMOTE_USER@$REMOTE_IP:$REMOTE_PATH &
+
+if [ $ANDROID = true ]; then
+    GOOS=linux GOARCH=arm go build -o out/tcsplitter_arm server.go
+    adb push out/tcsplitter_arm $ANDROID_PATH
+fi
+
+wait $!

@@ -6,11 +6,11 @@ REMOTE_PATH=/root/tcsplitter
 ANDROID=true ## push to phone
 ANDROID_PATH=/data/alpine/tcsplitter
 
-go build -o out/tcsplitter_amd64 server.go
+go build -o out/tcsplitter_amd64 ./*.go
 scp -r out/tcsplitter_amd64 $REMOTE_USER@$REMOTE_IP:$REMOTE_PATH &
 
 if [ $ANDROID = true ]; then
-    GOOS=linux GOARCH=arm go build -o out/tcsplitter_arm server.go
+    GOOS=linux GOARCH=arm go build -o out/tcsplitter_arm ./*.go
     adb push out/tcsplitter_arm $ANDROID_PATH
 fi
 

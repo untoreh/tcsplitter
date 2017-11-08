@@ -6,8 +6,9 @@ proto=tcp
 # proto=udp
 
 ./tcsplitter_amd64 \
-    --tick 333 \
-    --tock 666 \
+    --fec 10:3 \
+    --tick 100 \
+    --tock 200 \
     --protocol $proto \
     --conns 1 \
     --lassoes 1 \

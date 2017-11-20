@@ -1,12 +1,14 @@
 package main
 
 import (
-	"io"
 	"log"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/klauspost/reedsolomon"
 )
 
 type UDPListener struct {
@@ -30,38 +32,44 @@ type UDPListener struct {
 
 // ClientUDP is the client structure for UDP tunneling
 type ClientUDP struct {
+	end    byte
 	client []byte // 21bytes string (ipv4:port) for UDP
 	conn   *net.UDPConn
+	seq    chan uint32
+}
+
+// PayloadUDP with address field
+type PayloadUDP struct {
+	data []byte
+	ln   int
+	addr string
+}
+
+// ddlUDP for tracking timeouts of udp clients
+type ddlUDP struct {
+	clUDP *ClientUDP
+	time  int
 }
 
 func clientServerUDP(errchan chan<- error, addr *string, fchan chan<- []byte,
-	rtmap map[string]chan *ShotRtr, addchan chan<- *ClientUDP, rmchan chan<- *ClientUDP,
-	schan chan<- bool, clients map[string]*net.UDPAddr, uchan chan<- *net.UDPConn, pls int) {
+	retries bool, rtmap map[string]chan *ShotRtr, schan chan<- bool,
+	addchan chan<- *ClientUDP, rmchan chan<- interface{},
+	clients map[string]*net.UDPAddr, uchan chan<- *net.UDPConn,
+	fec Fec, conns int, frg Frags,
+	tichan <-chan bool, tochan <-chan bool, tid time.Duration, tod time.Duration) {
+
 	udpaddr, _ := net.ResolveUDPAddr("udp", *addr)
 	lp, err := net.ListenUDP("udp", udpaddr)
 	if err != nil {
 		log.Fatalf("error listening on %v: %v", *addr, err)
 	}
+	pcchan := make(chan *PayloadUDP, 3*conns)
 	uchan <- lp
-	handleClientToTunnelUDP(lp, fchan, rtmap, addchan, rmchan, schan, clients, pls)
-}
-
-// listens to connections from peers for data traffic
-func flingServerUDP(errchan chan<- error, addr *string, rfchan chan<- *Shot, pls int) {
-	addrTCP, _ := net.ResolveTCPAddr("tcp", *addr)
-	ln, err := net.ListenTCP("tcp", addrTCP)
-	if err != nil {
-		errchan <- err
-	}
-	for {
-		conn, err := ln.AcceptTCP()
-		if err != nil {
-			log.Println(err)
-			continue
-		}
-		// log.Printf("handling a received fling")
-		go handleTunnelToTunnelUDP(conn, rfchan, pls)
-	}
+	go tunnelPayloadsReaderUDP(pcchan, lp, frg, fec, tichan, tochan, tid, tod)
+	handleClientToTunnelUDP(lp, fchan, retries, rtmap, addchan, rmchan,
+		schan, pcchan, frg,
+		tichan, tochan, tid, tod,
+		clients)
 }
 
 // listens to sync commands requests
@@ -81,10 +89,11 @@ func syncServerUDP(errchan chan<- error, addr *string, clients map[string]*net.U
 	}
 }
 
-func reflingUDP(rtmap map[string]chan *ShotRtr, client []byte, data []byte, cq <-chan Conn, newc chan<- bool) {
+func reflingUDP(rtmap map[string]chan *ShotRtr, client []byte, data []byte, cq <-chan Conn, newc chan<- bool, rmtx *sync.Mutex) {
 	ct := string(client)
 	ofs := intBytes(data)
 	// log.Printf("launching refling for offset: %v", ofs)
+	rmtx.Lock()
 	for shotR := range rtmap[ct] {
 		if shotR.ofs != ofs {
 			// log.Printf("skipping shot with ofs: %v", shotR.ofs)
@@ -95,47 +104,24 @@ func reflingUDP(rtmap map[string]chan *ShotRtr, client []byte, data []byte, cq <
 			break
 		}
 	}
+	rmtx.Unlock()
 	// log.Printf("quitting refling")
 }
 
-// throw a bunch of connections for catching incoming data to the lassoServer
-func lassoUDP(rLasso *string, cachan chan<- *Shot, pls int, lassoes int, newc chan bool) {
-
-	// a conn queue for lassoes
-	cq := make(chan Conn, lassoes)
-
-	go connQueue(rLasso, cq, newc, lassoes)
-
-	// a throw for each connection
-	for c := range cq {
-		go throwUDP(c, newc, cachan, pls)
+func waitForMapsUDP(ct string, clientOfsMap map[string]map[uint32]*Shot, wait map[string]time.Duration) bool {
+	for clientOfsMap[ct] == nil {
+		if wait[ct] == 0 {
+			wait[ct] = 10
+		}
+		if wait[ct] < 30000 {
+			log.Printf("waiting for connection for client: %v", ct)
+			time.Sleep(wait[ct] * time.Millisecond)
+			wait[ct] = wait[ct] + 10
+		} else {
+			return false // skip the shot
+		}
 	}
-}
-
-// throw a single connection waiting for reading data
-func throwUDP(c Conn, newc chan<- bool, cachan chan<- *Shot, pls int) {
-	var n int
-	shot := Shot{
-		client:  make([]byte, 21),
-		ofs:     make([]byte, 4),
-		seq:     make([]byte, 4),
-		payload: make([]byte, pls),
-	}
-	// log.Printf("starting reading who is the client from %v", c.LocalAddr().String())
-
-	if !readShotFields(c, [3][]byte{shot.client, shot.ofs, shot.seq}, newc) {
-		return
-	}
-
-	if !readLassoPayload(c, shot.payload, &n, newc) {
-		return
-	}
-
-	shot.ln = uint32(n)
-
-	// log.Printf("channeling lassoed shot for udp")
-	cachan <- &shot
-	cClose(c, newc)
+	return true
 }
 
 // prepare received shots to be forwarded
@@ -143,155 +129,147 @@ func throwUDP(c Conn, newc chan<- bool, cachan chan<- *Shot, pls int) {
 // io bool false for tunnel->service (uses dialed udp Conn)
 func dispatchUDPServer(shotsChan <-chan *Shot, crchan chan<- *ClientCmd,
 	connMap map[string]*net.UDPConn,
-	clientOfsMap map[string]map[uint32]*Shot, mtx *sync.Mutex) {
-	cofs := make(map[string]uint32) // holds the current seq of each connection
-	rtMap := make(map[string]bool)  // holds the retries
-	cf := 0                         // counter for consecutive failed forwarding attempts
+	clientOfsMap map[string]map[uint32]*Shot, cOfsMap map[string]uint32,
+	skip int, mtx *sync.Mutex) {
+
+	cfmap := map[string]int{}
+	wait := map[string]time.Duration{} // each client init waiting times
+
 	for {
 		// mtx.Lock()
 		shot := <-shotsChan
-		// log.Printf("client id is %v", shot.client)
 		ct := string(shot.client)
 		ofs := intBytes(shot.ofs)
 		log.Printf("dispatching shot with ofs: %v", ofs)
 
-		// log.Printf("clientOfsMap is...")
-		// spew.Dump(clientOfsMap)
+		if !waitForMapsUDP(ct, clientOfsMap, wait) {
+			continue // skip the shot
+		}
 
-		st := time.Duration(10)
-		for clientOfsMap[ct] == nil {
-			//log.Printf("waiting for connection to get established, clients count: %v", len(clientOfsMap))
-			// log.Printf("clientOfsMap length: %v", len(clientOfsMap))
-			st = 2 * st
-			time.Sleep(st * time.Millisecond)
-		}
-		// schedule shots that actually are needed (in case a shot is received
-		// while the same shot is received after a resync request)
-		if ofs >= cofs[ct] {
+		// only forward on time shots
+		if ofs >= cOfsMap[ct] {
 			clientOfsMap[ct][ofs] = shot
+			cOfsMap, cfmap[ct] = forwardUDPServer(ct, cOfsMap, cfmap[ct], clientOfsMap, connMap, skip)
+			// mtx.Unlock()
 		}
-		// log.Printf("forwarding shots received from lassos...")
-		// mtx.Lock()
-		cofs, cf = forwardUDPServer(ct, cofs, cf, clientOfsMap, connMap)
-		if cf == 20 { // if failed forwarding for x times request missing shot at current offset
-			rtMap[ct] = retryUDP(ct, cofs[ct], crchan)
-		}
-		// mtx.Unlock()
 	}
 }
 
 func dispatchUDPClient(uchan <-chan *net.UDPConn, shotsChan <-chan *Shot, crchan chan<- *ClientCmd,
-	clients map[string]*net.UDPAddr, clientOfsMap map[string]map[uint32]*Shot, mtx *sync.Mutex) {
-	cofs := make(map[string]uint32) // holds the current seq of each connection
-	rtMap := make(map[string]bool)  // holds the retries
-	cf := 0                         // counter for consecutive failed forwarding attempts
-	c := <-uchan                    // wait for the connection of the UDP listener to be established
+	clients map[string]*net.UDPAddr, clientOfsMap map[string]map[uint32]*Shot, cOfsMap map[string]uint32,
+	skip int, mtx *sync.Mutex) {
+
+	cfmap := map[string]int{}          // counter for consecutive failed forwarding attempts
+	wait := map[string]time.Duration{} // each client init waiting times
+	c := <-uchan                       // wait for the connection of the UDP listener to be established
+
 	for {
 		// mtx.Lock()
 		shot := <-shotsChan
-		// log.Printf("got a caught shot")
-		// log.Printf("client id is %v", shot.client)
 		ct := string(shot.client)
 		ofs := intBytes(shot.ofs)
 		log.Printf("dispatching shot with ofs: %v", ofs)
 
-		// log.Printf("clientOfsMap is...")
-		// spew.Dump(clientOfsMap)
-
-		st := time.Duration(10)
-		for clientOfsMap[ct] == nil {
-			//log.Printf("waiting for connection to get established, clients count: %v", len(clientOfsMap))
-			// log.Printf("clientOfsMap length: %v", len(clientOfsMap))
-			st = 2 * st
-			time.Sleep(st * time.Millisecond)
+		if !waitForMapsUDP(ct, clientOfsMap, wait) {
+			continue
 		}
-		// schedule shots that actually are needed (in case a shot is received
-		// while the same shot is received after a resync request)
-		if ofs >= cofs[ct] {
+
+		// only forward on time shots
+		if ofs >= cOfsMap[ct] {
 			clientOfsMap[ct][ofs] = shot
+			cOfsMap, cfmap[ct] = forwardUDPClient(c, ct, cOfsMap, cfmap[ct], clientOfsMap, clients, skip)
+			// mtx.Unlock()
 		}
-		// log.Printf("forwarding shots received from lassos...")
-		// mtx.Lock()
-		cofs, cf = forwardUDPClient(c, ct, cofs, cf, clientOfsMap, clients)
-		if cf == 20 { // if failed forwarding for x times request missing shot at current offset
-			log.Printf("retrying a shot...")
-			rtMap[ct] = retryUDP(ct, cofs[ct], crchan)
-		}
-		// mtx.Unlock()
 	}
-}
-
-// compose a client cmd request to be written to lassos
-func retryUDP(ct string, ofs uint32, crchan chan<- *ClientCmd) bool {
-	update := ClientCmd{
-		cmd:    []byte{2}, // 2 is the chosen byte n for retries
-		client: []byte(ct),
-		data:   bytesInt(ofs),
-	}
-	// log.Printf("crafting a retry request")
-	crchan <- &update
-	return true
 }
 
 // forward shots in an ordered manner to the right client
 func forwardUDPServer(ct string, cofs map[string]uint32, cf int, clientOfsMap map[string]map[uint32]*Shot,
-	connMap map[string]*net.UDPConn) (map[string]uint32, int) {
-	// counter for forwarded packages
+	connMap map[string]*net.UDPConn, skip int) (map[string]uint32, int) {
+	var err error
 	for {
 		// log.Printf("LOCAL forwarding...from tunneled server to client")
 		ofs := cofs[ct]
-		var err error
 		// log.Printf("frmap seq keys for client are...\n")
-		// log.Printf("checking ofsmap")
 		if shot, ready := clientOfsMap[ct][ofs]; ready {
-			// log.Printf("writiing in forward udp, using ct %v, len %v", ct, len(ct))
-			// log.Printf("the connMap is this:")
 			_, err = connMap[ct].Write(shot.payload[0:shot.ln])
-			// log.Printf("did the writing")
 			if err != nil { // something wrong with the connection
 				log.Printf("forward stopped: %v", err)
 				return cofs, cf
-			} else {
-				log.Printf("forwarding successful, ofs: %v, seq: %v", intBytes(shot.ofs), intBytes(shot.seq))
-				delete(clientOfsMap[ct], cofs[ct]) // clear the forwarded shot, loop again
-				cofs[ct] = intBytes(shot.seq)
-				cf = 0 // reset failed forwarding
 			}
+			log.Printf("forwarding successful, ofs: %v, seq: %v", intBytes(shot.ofs), intBytes(shot.seq))
+			delete(clientOfsMap[ct], cofs[ct]) // clear the forwarded shot, loop again
+			cofs[ct] = intBytes(shot.seq)
+			cf = 0 // reset failed forwarding
+
+		} else if cf == skip { // skip the shot
+			// sort the shots in the map and pick the lowest offset
+			o := 0
+			offsets := make(u32Slice, len(clientOfsMap)) // if we want to use sort lib we need ints
+			for ofs := range clientOfsMap[ct] {
+				offsets[o] = ofs
+			}
+			sort.Sort(offsets)
+			cofs[ct] = offsets[0] // this is the offset of the next shot
+			cf = 0                // reset failed forwarding
+			// write the shot
+			shot = clientOfsMap[ct][cofs[ct]]
+			_, err := connMap[ct].Write(shot.payload[0:shot.ln])
+			if err != nil { // something wrong with the connection
+				log.Printf("forward stopped: %v", err)
+				return cofs, cf
+			}
+			// shot was written jump to the next
+			log.Printf("forwarding successful, ofs: %v, seq: %v", intBytes(shot.ofs), intBytes(shot.seq))
+			delete(clientOfsMap[ct], cofs[ct]) // clear the forwarded shot, loop again
+			cofs[ct] = intBytes(shot.seq)
 		} else {
-			log.Printf("shot not ready...")
-			cf++ // increase failed forwarding attempts
-			break
+			cf++  // increase failed forwarding attempts
+			break // wait for next dispatch
 		}
 	}
 	return cofs, cf
 }
 
 func forwardUDPClient(c *net.UDPConn, ct string, cofs map[string]uint32, cf int, clientOfsMap map[string]map[uint32]*Shot,
-	clients map[string]*net.UDPAddr) (map[string]uint32, int) {
-	// counter for forwarded packages
+	clients map[string]*net.UDPAddr, skip int) (map[string]uint32, int) {
+	var err error
 	for {
 		// log.Printf("LOCAL forwarding...from tunneled server to client")
 		ofs := cofs[ct]
-		var err error
 		// log.Printf("frmap seq keys for client are...\n")
-		// log.Printf("checking ofsmap")
 		if shot, ready := clientOfsMap[ct][ofs]; ready {
-			// log.Printf("writiing in forward udp, using ct %v, len %v", ct, len(ct))
-			// log.Printf("the UDP write to is this:")
-			log.Printf("%v", clients[ct])
 			_, err = c.WriteToUDP(shot.payload[0:shot.ln], clients[ct])
-			// log.Printf("did the writing")
 			if err != nil { // something wrong with the connection
 				log.Printf("forward stopped: %v", err)
 				return cofs, cf
-			} else {
-				log.Printf("forwarding successful, ofs: %v, seq: %v", intBytes(shot.ofs), intBytes(shot.seq))
-				delete(clientOfsMap[ct], cofs[ct]) // clear the forwarded shot, loop again
-				cofs[ct] = intBytes(shot.seq)
-				cf = 0 // reset failed forwarding
 			}
+			log.Printf("forwarding successful, ofs: %v, seq: %v", intBytes(shot.ofs), intBytes(shot.seq))
+			delete(clientOfsMap[ct], cofs[ct]) // clear the forwarded shot, loop again
+			cofs[ct] = intBytes(shot.seq)
+			cf = 0 // reset failed forwarding
+		} else if cf == skip {
+			// sort the shots in the map and pick the lowest offset
+			o := 0
+			offsets := make(u32Slice, len(clientOfsMap)) // if we want to use sort lib we need ints
+			for ofs := range clientOfsMap[ct] {
+				offsets[o] = ofs
+			}
+			sort.Sort(offsets)
+			cofs[ct] = offsets[0] // this is the offset of the next shot
+			cf = 0                // reset failed forwarding
+			// write the shot
+			shot = clientOfsMap[ct][cofs[ct]]
+			_, err := c.WriteToUDP(shot.payload[0:shot.ln], clients[ct])
+			if err != nil { // something wrong with the connection
+				log.Printf("forward stopped: %v", err)
+				return cofs, cf
+			}
+			// shot was written jump to the next
+			log.Printf("forwarding successful, ofs: %v, seq: %v", intBytes(shot.ofs), intBytes(shot.seq))
+			delete(clientOfsMap[ct], cofs[ct]) // clear the forwarded shot, loop again
+			cofs[ct] = intBytes(shot.seq)
 		} else {
-			log.Printf("shot not ready...")
 			cf++ // increase failed forwarding attempts
 			break
 		}
@@ -300,205 +278,171 @@ func forwardUDPClient(c *net.UDPConn, ct string, cofs map[string]uint32, cf int,
 }
 
 func handleClientToTunnelUDP(c *net.UDPConn, fchan chan<- []byte,
-	rtmap map[string]chan *ShotRtr, addchan chan<- *ClientUDP, rmchan chan<- *ClientUDP,
-	schan chan<- bool, clients map[string]*net.UDPAddr, pls int) {
+	retries bool, rtmap map[string]chan *ShotRtr,
+	addchan chan<- *ClientUDP, rmchan chan<- interface{},
+	schan chan<- bool, pcchan <-chan *PayloadUDP, frg Frags,
+	tichan <-chan bool, tochan <-chan bool, tid time.Duration, tod time.Duration,
+	clients map[string]*net.UDPAddr) {
 	seqmap := map[string]uint32{}
+	var err error
 
 	// log.Printf("shot client id is: %v", timeBytes(shot.client))
+
+	cLock := &sync.Mutex{} // a lock for deadlining clients
+	ddl := map[string]*ddlUDP{}
+	go deadlineUDP(ddl, rmchan, cLock)
+
 	for {
-		payload := make([]byte, pls)
-		n, addr, err := c.ReadFrom(payload)
-		// log.Printf("read %v bytes", n)
-		// log.Printf("read payload is...\n%v", string(payload))
-		if err != nil {
-			log.Printf("udp read connection, error: %v", err)
-			c.Close()
+		// log.Printf("waiting for a paylaod")
+		payload, open := <-pcchan
+		// log.Printf("got a payload")
+		if !open {
+			log.Printf("terminating CTT handler (UDP)")
 			break
 		}
-		if n == 0 {
-			// log.Printf("closing udp connection")
-			cl := []byte(addr.String())
-			rmchan <- &ClientUDP{client: cl}
-			continue
-		}
+		// payload := make([]byte, frg.payload)
+		// n, addr, err := c.ReadFrom(payload)
+		// log.Printf("read %v bytes", n)
+		// log.Printf("read payload is...\n%v", string(payload))
+		// log.Printf("closing udp connection")
 		// log.Printf("the shot to be sent has this payload (length %v)...%v", n, payload)
-		ct := addr.String()
+		ct := payload.addr
 		lnCt := len(ct)
 		if lnCt != 21 {
 			ct = ct + strings.Repeat("\x00", 21-lnCt)
 		}
 
+		var clUDP *ClientUDP
+		cLock.Lock()
 		if clients[ct] == nil {
 			// init ofs and seq
 			seqmap[ct] = 0
-			clients[ct], err = net.ResolveUDPAddr("udp", addr.String())
-
+			clients[ct], err = net.ResolveUDPAddr("udp", payload.addr)
 			if err != nil {
 				log.Printf("error resolving client udp address: %v", err)
 			}
 
-			cl := []byte(ct)
-			addchan <- &ClientUDP{client: cl}
-			defer func() {
-				time.Sleep(30 * time.Second)
-				rmchan <- &ClientUDP{client: cl}
-			}()
+			clUDP = &ClientUDP{
+				end:    0, // 0 for client
+				client: []byte(ct),
+				seq:    make(chan uint32, 1),
+			}
+			clUDP.seq <- 0
+
+			addchan <- clUDP
+			// deadline tracking
+			ddl[ct] = &ddlUDP{
+				clUDP: clUDP,
+			}
 		}
+		// set client connection deadline
+		ddl[ct].time = time.Now().Second() + 30
+		cLock.Unlock()
 
 		// the raw shot
-		dst := make([]byte, (29 + n)) // make a slice big enough, 29 = 21 + 4 + 4
+		dst := make([]byte, (29 + payload.ln)) // make a slice big enough, 29 = 21 + 4 + 4
 		// concatenate the shot fields
-		copy(dst[0:], addr.String())         // client
+		copy(dst[0:], payload.addr)          // client
 		copy(dst[21:], bytesInt(seqmap[ct])) // ofs
 		// log.Printf("wrote ofs : %v", seqmap[cls])
 
-		// init retry shot here before we up the seq
-		shotR := ShotRtr{
-			ofs: seqmap[ct],
+		var shotR ShotRtr
+		if retries {
+			// init retry shot here before we up the seq
+			shotR = ShotRtr{
+				ofs: seqmap[ct],
+			}
 		}
 
 		// continue concat
-		seqmap[ct] += uint32(n)
+		seqmap[ct] += uint32(payload.ln)
 		copy(dst[25:], bytesInt(seqmap[ct])) // seq
 		// log.Printf("wrote seq: %v", seqmap[cls])
-		copy(dst[29:], payload[0:n]) // payload
+		copy(dst[29:], payload.data[0:payload.ln]) // payload
 
 		// raw shots for the fling channel
+		log.Printf("put a dst into the fling channel")
 		fchan <- dst
-		// log.Printf("put a dst into the fling channel")
+		cLock.Lock()
+		<-ddl[ct].clUDP.seq
+		ddl[ct].clUDP.seq <- seqmap[ct]
+		cLock.Unlock()
 
-		// retry shots for the retry channel
-		shotR.dst = dst
-		go queueShotR(rtmap[addr.String()], &shotR)
-		schan <- true
+		if retries {
+			// retry shots for the retry channel
+			shotR.dst = dst
+			go queueShotR(rtmap[payload.addr], &shotR)
+			schan <- true
+		}
 	}
 }
 
-// manages shots received from the remote end of the tunnel UDP
-func handleTunnelToTunnelUDP(c Conn, rfchan chan<- *Shot, pls int) {
-	var n int
-
-	shot := Shot{
-		client:  make([]byte, 21),
-		ofs:     make([]byte, 4),
-		seq:     make([]byte, 4),
-		payload: make([]byte, pls),
+// delete udp clients not forwarding for more than 30 seconds
+func deadlineUDP(ddl map[string]*ddlUDP, rmchan chan<- interface{}, cLock *sync.Mutex) {
+	for {
+		now := time.Now().Second()
+		cLock.Lock()
+		for _, ddlCl := range ddl {
+			if ddlCl.time < now {
+				rmchan <- ddlCl.clUDP
+			}
+		}
+		cLock.Unlock()
+		time.Sleep(30 * time.Second)
 	}
-
-	if !readShotFieldsNoQ(c, [3][]byte{shot.client, shot.ofs, shot.seq}) {
-		return
-	}
-
-	if !readShotPayloadNoQ(c, shot.payload, &n) {
-		return
-	}
-
-	shot.ln = uint32(n)
-
-	// go sndack(c)
-	rfchan <- &shot
-	go c.Close()
-	// log.Printf("channeled a shot")
 }
 
 // manages connections on the client syncServer for updating the clients list
 func handleSyncConnectionUDP(c Conn, clients map[string]*net.UDPAddr, cchan chan<- *ClientCmd) {
-	update := ClientCmd{
+
+	update := &ClientCmd{
 		cmd:    make([]byte, 1),
 		client: make([]byte, 21), // ipv4+port string = 21 chars
 	}
-	_, err := c.Read([]byte(update.cmd))
-	if err != nil {
-		log.Printf("sync command read error: %v", err)
-		c.Close()
+
+	if ok := readSyncConnectionHeaders(c, update); !ok {
 		return
 	}
-	_, err = c.Read([]byte(update.client))
-	if err != nil {
-		log.Printf("sync client read error: %v", err)
-		c.Close()
+	if ok := readSyncConnectionData(c, update); !ok {
 		return
 	}
-	if update.cmd[0] == 2 { // make this a switch eventually
-		// we say cmd 2 is for retries commands
-		// so this needs to be an offset
-		// so it is 4 bytes
-		update.data = make([]byte, 4)
-		_, err = c.Read(update.data)
-		if err != nil {
-			log.Printf("sync data read error: %v", err)
-			c.Close()
-			return
-		}
-	}
-	cchan <- &update
+
+	endSyncConnection(c, update, cchan)
 }
 
-func toLassosUDP(pachan <-chan *Shot, laschan <-chan Conn) {
-	for {
-		shot := <-pachan
-		lasso := <-laschan // get a lasso
-		// make a slice big enough
-		dst := make([]byte, (29 + shot.ln))
-		// concatenate shot fieds
-		copy(dst[0:], shot.client)
-		copy(dst[21:], shot.ofs)
-		copy(dst[25:], shot.seq)
-		copy(dst[29:], shot.payload[0:shot.ln])
-		lasso.Write(dst)
-		log.Printf("wrote a shot to a lasso ofs: %v, seq:: %v", intBytes(shot.ofs), intBytes(shot.seq))
-		e := lasso.Close()
-		log.Printf("closed lasso with error: %v", e)
-	}
+func makeRawUDP(shot *Shot) []byte {
+	// make a slice big enough
+	dst := make([]byte, (29 + shot.ln))
+	// concatenate shot fieds
+	copy(dst[0:], shot.client)
+	copy(dst[21:], shot.ofs)
+	copy(dst[25:], shot.seq)
+	copy(dst[29:], shot.payload[0:shot.ln])
+	log.Printf("shot with ofs: %v, dst len: %v", intBytes(shot.ofs), len(dst))
+	return dst
 }
 
-// the handler for udp only starts a client udp connection to the service to tunnel
-func serviceToTunnelHandlerUDP(c *net.UDPConn, client string, pachan chan<- *Shot, pls int) {
-
-	// log.Printf("shot server id is: %v", timeBytes(shot.client))
-	seq := uint32(0)
-	cl := []byte(client)
-	for {
-		shot := Shot{
-			client:  cl, // the client id is already decided remotely
-			payload: make([]byte, pls),
-		}
-		// log.Printf("reading from connection...for client %v", timeBytes(shot.client))
-		n, err := c.Read(shot.payload)
-		// log.Printf("read some stuff!")
-		if err != nil && n == 0 {
-			if err == io.EOF {
-				log.Printf("breaking tunnel to service connection: %v", err)
-				break
-			} else {
-				log.Printf("error during service to tunnel connection: %v", err)
-				break
-			}
-		}
-		shot.ln = uint32(n)
-		shot.ofs = bytesInt(seq)
-		seq += uint32(n)
-		shot.seq = bytesInt(seq)
-		// log.Printf("channeling shot from service to client UDP")
-		pachan <- &shot
-	}
-}
-
-func syncHandlerUDP(addchan <-chan *ClientUDP, rmchan <-chan *ClientUDP, rSync *string, clients map[string]*net.UDPAddr,
+func syncHandlerUDP(addchan <-chan *ClientUDP, rmchan chan interface{}, rSync *string, clients map[string]*net.UDPAddr,
 	frmap map[string]map[uint32]*Shot, flmap map[string]map[uint32]*Shot, cchan <-chan *ClientCmd, ccon map[string]*net.UDPConn,
-	forward *string, pachan chan<- *Shot, retries bool, rtmap map[string]chan *ShotRtr, mtx *sync.Mutex, pls int,
-	st int, cq <-chan Conn, newc chan<- bool, schan <-chan bool) {
+	forward *string, pachan chan *Shot, padchan chan []byte, padRchan chan []byte, retries bool, rtmap map[string]chan *ShotRtr, mtx *sync.Mutex,
+	frg Frags, fec Fec, tichan <-chan bool, tochan <-chan bool, tid time.Duration, tod time.Duration,
+	conns int, cq <-chan Conn, newc chan<- bool, schan <-chan bool, rOfsMap map[string]uint32, lOfsMap map[string]uint32) {
+	// rSync TCPAddr
+	rSyncAddr, _ := net.ResolveTCPAddr("tcp", *rSync)
+	// a mutex for the retry map
+	rmtx := &sync.Mutex{}
 	for {
 		// loop over channels events to keep the list of persistent connections updated
 		select {
 		case client := <-addchan:
 			ct := string(client.client)
+			mtx.Lock()
 			// when creating the index key locally need to make sure it is 21 bytes long
 			lnCt := len(ct)
 			if lnCt != 21 {
 				ct = ct + strings.Repeat("\x00", 21-lnCt)
 			}
-			qlen := st * 100 // the length of the buffered retry shots
+			qlen := conns * 100 // the length of the buffered retry shots
 
 			// local writing for UDP is handled by the listener connection
 			// log.Printf("local udp client to tunnel connection with ct %v, len %v", ct, len(ct))
@@ -509,56 +453,58 @@ func syncHandlerUDP(addchan <-chan *ClientUDP, rmchan <-chan *ClientUDP, rSync *
 				go rtFlusher(schan, rtmap[ct], qlen)  // start the flusher for the client payloads buffer
 			}
 			log.Printf("payloads maps for %v initialized", ct)
+			mtx.Unlock()
 
 			update := ClientCmd{
 				cmd:    []byte{1},
 				client: client.client,
 			}
-			sendClientUpdateUDP(update, rSync)
-		case client := <-rmchan:
+			// only a client can add a connection
+			sendClientUpdate(&update, rSyncAddr, nil, 100)
+		case ifc := <-rmchan:
+			log.Printf("removing a udp connection")
+			client := ifc.(*ClientUDP)
 			ct := string(client.client)
+			mtx.Lock()
+			if clients[ct] != nil {
+				seq := <-client.seq
 
-			go clearConnUDP(clients, ccon, frmap, rtmap, ct)
+				go clearConn("udp", clients, ccon, frmap, flmap, rtmap, ct, 0, lOfsMap, mtx)
 
-			update := ClientCmd{
-				cmd:    []byte{0},
-				client: client.client,
+				update := &ClientCmd{
+					cmd:    []byte{0},
+					client: client.client,
+					data:   bytesInt(seq),
+				}
+				// depending on who closed the connection choose the approprioate way to update
+				whichSendClientUpdate(client.end, update, rSyncAddr, padRchan)
 			}
-			sendClientUpdateUDP(update, rSync)
 		case update := <-cchan: // this case is basically for server requests from remote clients
 			ct := string(update.client)
 
 			switch {
 			case update.cmd[0] == 0:
-				go clearConnUDP(clients, ccon, frmap, rtmap, ct)
+				mtx.Lock()
+				go clearConn("udp", clients, ccon, frmap, flmap, rtmap, ct, intBytes(update.data), rOfsMap, mtx)
 			case update.cmd[0] == 1:
-				clients[ct], _ = net.ResolveUDPAddr("udp", strings.TrimSuffix(string(update.client), "\x00"))
-				udpForward, _ := net.ResolveUDPAddr("udp", *forward)
-				qlen := st * 100 // the length of the buffered retry shots
-
-				// open local connection to reflect the synced clients list
-				// the address is forwardbecause we can only receive new connection
-				// updates from clients asking for a connection on the service tunneled
-				// through this peer.
-				conn, err := net.DialUDP("udp", nil, udpForward)
-				if err != nil {
-					log.Printf("error dialing udp tunnel->service connection: %v", err)
+				mtx.Lock()
+				if !addCtUDP(ct, clients, ccon, rmchan,
+					frmap, flmap, rtmap,
+					pachan, padchan, schan,
+					tichan, tochan, tid, tod,
+					conns, retries, fec, frg, forward) {
+					// failed to connect notify client
+					update := &ClientCmd{
+						cmd:    []byte{0},
+						client: update.client,
+						data:   update.data,
+					}
+					sendClientUpdate(update, nil, padRchan, 100)
 				}
-				ccon[ct] = conn
-				// log.Printf("putting conn inside key %v, len %v", ct, len(ct))
-				frmap[ct] = make(map[uint32]*Shot) // init remote payloads map
-				flmap[ct] = make(map[uint32]*Shot) // init local payloads map
-				if retries {
-					rtmap[ct] = make(chan *ShotRtr, qlen) // init buffered payloads map
-					go rtFlusher(schan, rtmap[ct], qlen)  // start the flusher for the client payloads buffer
-				}
-
-				go serviceToTunnelHandlerUDP(ccon[ct], ct, pachan, pls)
-				log.Printf("payloads maps for %v initialized", ct)
-				// log.Printf("handled status case update, frmap : %v, flmap: %v", len(frmap), len(flmap))
+				mtx.Unlock()
 			case update.cmd[0] == 2: // this is a retry command
 				// log.Printf("received a retry command")
-				go reflingUDP(rtmap, update.client, update.data, cq, newc)
+				go reflingUDP(rtmap, update.client, update.data, cq, newc, rmtx)
 
 			}
 			// log.Printf("map updated!: \n")
@@ -567,42 +513,269 @@ func syncHandlerUDP(addchan <-chan *ClientUDP, rmchan <-chan *ClientUDP, rSync *
 	}
 }
 
-func sendClientUpdateUDP(update ClientCmd, rSync *string) {
-	conn, err := net.Dial("tcp", *rSync)
-	if err != nil {
-		log.Fatalf("error connecting to remote status server: %v", err)
+func addCtUDP(ct string, clients map[string]*net.UDPAddr, ccon map[string]*net.UDPConn, rmchan chan interface{},
+	frmap map[string]map[uint32]*Shot, flmap map[string]map[uint32]*Shot, rtmap map[string]chan *ShotRtr,
+	pachan chan *Shot, padchan chan []byte, schan <-chan bool,
+	tichan <-chan bool, tochan <-chan bool, tid time.Duration, tod time.Duration,
+	conns int, retries bool, fec Fec, frg Frags, forward *string) bool {
+	if clients[ct] != nil { // already added
+		return false
 	}
-	// make a slice big enough 1 + 21
-	dst := make([]byte, 22)
-	// concatenate shot fieds
-	copy(dst[0:], update.cmd)
-	copy(dst[1:], update.client)
-	// log.Printf("client update data len: %v", len(dst))
-	conn.Write(dst)
-	// log.Printf("client update wrote %v, err: %v", n, e)
-	conn.Close()
-	// log.Printf("closed client update with error: %v", e)
+	clients[ct], _ = net.ResolveUDPAddr("udp", strings.TrimSuffix(string(ct), "\x00"))
+	udpForward, _ := net.ResolveUDPAddr("udp", *forward)
+
+	// open local connection to reflect the synced clients list
+	// the address is forward because we can only receive new connection
+	// updates from clients asking for a connection on the service tunneled
+	// through this peer.
+	conn, err := net.DialUDP("udp", nil, udpForward)
+	if err != nil {
+		log.Printf("error dialing udp tunnel->service connection: %v", err)
+		return false
+	} else {
+		ccon[ct] = conn
+	}
+
+	frmap[ct] = make(map[uint32]*Shot) // init remote payloads map
+	flmap[ct] = make(map[uint32]*Shot) // init local payloads map
+
+	if retries {
+		qlen := conns * 100                   // the length of the buffered retry shots
+		rtmap[ct] = make(chan *ShotRtr, qlen) // init buffered payloads map
+		go rtFlusher(schan, rtmap[ct], qlen)  // start the flusher for the client payloads buffer
+	}
+
+	cl := &ClientUDP{
+		end:    1, // 1 for server end of the client instance
+		client: []byte(ct),
+		conn:   ccon[ct],
+		seq:    make(chan uint32, 1),
+	}
+	go serviceToTunnelHandler("udp", ccon[ct], cl, rmchan,
+		pachan, padchan,
+		frg, conns, fec,
+		tichan, tochan, tid, tod)
+
+	log.Printf("payloads maps for %v initialized", ct)
+	// log.Printf("handled status case update, frmap : %v, flmap: %v", len(frmap), len(flmap))
+	return true
 }
 
-func clearConnUDP(clients map[string]*net.UDPAddr, ccon map[string]*net.UDPConn,
-	shotsMap map[string]map[uint32]*Shot, retriesMap map[string]chan *ShotRtr, ct string) {
-	time.Sleep(5 * time.Second)
-	// wait until the shots map is empty
-	for len(shotsMap[ct]) > 0 {
+func tunnelPayloadsReaderUDP(cpchan chan *PayloadUDP, c *net.UDPConn, frg Frags, fec Fec,
+	tichan <-chan bool, tochan <-chan bool, tid time.Duration, tod time.Duration) {
+
+	var plchan chan *PayloadUDP
+
+	if fec.ln != 0 {
+		// get the encoder
+		enc, e := reedsolomon.New(fec.ds, fec.ps)
+		if e != nil {
+			log.Printf("failed creating reedsolomon encoder: %v", e)
+			close(cpchan)
+			return
+		}
+		// whole payload to read is multiplied by the number of data shards
+		wpl := frg.payload * fec.ds
+		// start the payloads channeler, 4 is the header indicating the wpl size
+		go readTunnelPayloadUDP(c, plchan, 4, wpl, tichan, tochan, tid, tod, false)
+		var i int
+		// generate the bounds for each data shard
+		bounds := make([][2]int, fec.ds)
+		for d := range bounds {
+			bounds[d][0] = d * frg.payload
+			bounds[d][1] = (d + 1) * frg.payload
+		}
+		for {
+			shards := make([][]byte, fec.ln)
+			i = 0
+
+			// fetch the channeled data chunk already having offset for header
+			log.Printf("reading payload...from reader")
+			udpPl := <-plchan
+			data := udpPl.data
+			log.Printf("read payload...from reader")
+			// log.Printf("whole payload length: %v bytes ", n)
+			copy(data[:4], bytesInt(uint32(udpPl.ln))) // prepend the length to the payload
+
+			// shards, e = enc.Split(data)
+			// if e != nil {
+			// 	log.Printf("error splitting the payload: %v", e)
+			// }
+
+			// shard the data
+			for i = range shards[:fec.ds] {
+				shards[i] = data[bounds[i][0]:bounds[i][1]]
+			}
+			// populate parity shards (using counter from data shards)
+			for range shards[fec.ds:] {
+				i++
+				shards[i] = make([]byte, frg.payload)
+			}
+			// encode the shards
+			e = enc.Encode(shards)
+			if e != nil {
+				log.Printf("error encoding data: %v", e)
+			}
+
+			// ok, e := enc.Verify(shards)
+			// log.Printf("verify ok: %v, e: %v",ok, e)
+
+			// channel each shard as a shot payload
+			for i = range shards {
+				cpchan <- &PayloadUDP{
+					data: shards[i],
+					ln:   frg.payload,
+					addr: udpPl.addr,
+				}
+			}
+		}
+	} else {
+		// start directly the payloads channeler
+		readTunnelPayloadUDP(c, cpchan, 0, frg.payload, tichan, tochan, tid, tod, false)
+	}
+	// closing connection and relative payloads channel
+	c.Close()
+	// wait for all the payloads to be processed
+	for len(cpchan) > 0 {
 		time.Sleep(1 * time.Second)
 	}
-	// remote client from client list
-	delete(clients, ct)
-	// close local connection to reflect the synced clients list
-	// for UDP only the server end has a connection since
-	// on the client side the udp listener does not return connections
-	if ccon[ct] != nil {
-		ccon[ct].Close()
-		delete(ccon, ct)
+	close(cpchan)
+	log.Printf("stopped reading tunnel payloads")
+}
+
+// to be used with its own goroutine
+func readTunnelPayloadUDP(c *net.UDPConn, plchan chan *PayloadUDP, head int, pll int,
+	tichan <-chan bool, tochan <-chan bool, tid time.Duration, tod time.Duration, buf bool,
+) {
+	var n int
+	var a string
+	var na net.Addr
+	var e error
+	plmap := map[string]*PayloadUDP{}
+	plmtx := &sync.Mutex{}
+	// first read
+	// log.Printf("reading the first")
+	switch buf {
+	case true:
+		for {
+			pl := make([]byte, pll) // slice to work with when reading
+
+			c.SetReadDeadline(time.Now().Add(tod)) // wait max one tock
+			// log.Printf("reading payload")
+			n, na, e = c.ReadFrom(pl[head:])
+			if na != nil {
+				a = na.String()
+			}
+			bufferPayloadsUDP(n, a, e, pl, pll, plmap, plchan, plmtx, tochan, tod)
+		}
+	default:
+		for {
+			pl := make([]byte, pll) // slice to work with when reading
+
+			c.SetReadDeadline(time.Now().Add(tod)) // wait max one tock
+			// log.Printf("reading payload")
+			n, na, e = c.ReadFrom(pl[head:])
+			if na != nil {
+				a = na.String()
+			}
+			if n != 0 {
+				plchan <- &PayloadUDP{
+                    data: pl,
+                    ln: n,
+                    addr: a,
+                }
+			}
+		}
 	}
-	// delete payloads map
-	delete(shotsMap, ct)
-	// delete retries channel
-	delete(retriesMap, ct)
-	// log.Printf("connection %v cleared", ct)
+
+}
+
+func bufferPayloadsUDP(n int, a string, e error, pl []byte, pll int,
+	plmap map[string]*PayloadUDP, plchan chan *PayloadUDP, plmtx *sync.Mutex,
+	tochan <-chan bool, tod time.Duration) {
+	if !ckRead(n, e) { // not a timeout, possibly EOF
+		plmtx.Lock()
+		switch {
+		case plmap[a] != nil && n == 0: // flush existing payload
+			plchan <- plmap[a]
+			delete(plmap, a)
+		case plmap[a] != nil && n != 0:
+			switchPayloadUDP(plmap, plchan, n, pl, pll, a)
+			if _, w := plmap[a]; w { // the switcher might have queued a remeaining payload
+				plchan <- plmap[a]
+				delete(plmap, a)
+			}
+		case plmap[a] == nil && n != 0: // channel it directly, probably the last packet
+			plchan <- &PayloadUDP{
+				data: pl,
+				ln:   n,
+				addr: a,
+			}
+		}
+		plmtx.Unlock()
+		return
+	} else if n == 0 { // possibly a timeout with an empty read
+		return
+	} else { // the read was good
+		// check if a previous payload carrying this address is waiting
+		plmtx.Lock()
+		if _, w := plmap[a]; w { // if a payload is waiting, copy some data
+			switchPayloadUDP(plmap, plchan, n, pl, pll, a)
+			plmtx.Unlock()
+		} else { // no payloads waiting, make a new one
+			pp := &PayloadUDP{
+				data: pl,
+				ln:   n,
+				addr: a,
+			}
+			if n == pll { // it is already a full payload, channel
+				plmtx.Unlock()
+				<-tochan
+				plchan <- pp
+			} else { // it is not full, map and deadline
+				plmap[a] = pp
+				go func() {
+					time.Sleep(tod)
+					plmtx.Lock()
+					if plmap[a] != nil {
+						plchan <- plmap[a]
+						delete(plmap, a)
+					}
+					plmtx.Unlock()
+				}()
+				plmtx.Unlock()
+			}
+		}
+	}
+	return
+}
+
+// decide what to do with a fresh udp payload
+func switchPayloadUDP(plmap map[string]*PayloadUDP, plchan chan *PayloadUDP,
+	n int, pl []byte, pll int, a string) {
+	s := plmap[a].ln + n
+	switch { // compare sizes
+	case s > pll: // it is bigger: copy,channel,map the rest
+		diff := pll - plmap[a].ln         // how much can we copy
+		copy(plmap[a].data[plmap[a].ln:], // copy
+			pl[:diff])
+		plmap[a].ln = pll       // payload map is saturated
+		plchan <- plmap[a]      // channel
+		plmap[a] = &PayloadUDP{ // map the rest (a new payload)
+			data: make([]byte, pll),
+			ln:   n - diff,
+			addr: a,
+		}
+		copy(plmap[a].data[0:], pl[diff:])
+	case s == pll:
+		copy(plmap[a].data[plmap[a].ln:], // copy all the new pl
+			pl)
+		plmap[a].ln = pll
+		plchan <- plmap[a]
+		delete(plmap, a) // clear the payload from the map
+	case s < pll:
+		copy(plmap[a].data[plmap[a].ln:], // copy all the new pl
+			pl[:n])
+		plmap[a].ln = s // the new size is the sum
+	}
 }

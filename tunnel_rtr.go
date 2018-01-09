@@ -5,6 +5,8 @@ import (
     "net"
     "sync"
     "time"
+
+    "github.com/aristanetworks/goarista/dscp"
 )
 
 // ShotRtr a shot for the retry channel
@@ -13,10 +15,12 @@ type ShotRtr struct {
     dst []byte // raw shot
 }
 
-// listens to reverse lasso connections from clients for reverse sync requests
-func lassoRServer(errchan chan<- error, addr *string, padRchan chan []byte) {
+// listens to reverse fling connections from clients for reverse sync requests
+func flingRServer(errchan chan<- error, addr *string, padRchan chan []byte) {
     addrTCP, _ := net.ResolveTCPAddr("tcp", *addr)
-    ln, err := net.ListenTCP("tcp", addrTCP)
+    // ln, err := net.ListenTCP("tcp", addrTCP)
+    tos := byte(46)
+    ln, err := dscp.ListenTCPWithTOS(addrTCP, tos)
     if err != nil {
         errchan <- err
     }
@@ -27,27 +31,27 @@ func lassoRServer(errchan chan<- error, addr *string, padRchan chan []byte) {
             continue
         }
         // write queued up raw reverse commands (ClientCmd)
-        go handleLassosR(conn, padRchan)
+        go handleTunnelToTunnelR(conn, padRchan)
     }
 
 }
 
-// lassos for server to client sync requests
-func lassoR(rLassoRtr *string, clcmdchan chan<- *ClientCmd, frg Frags, lassoes int, newc chan bool, tid time.Duration) {
+// flinger for server to client sync requests
+func flingerR(rLassoRtr *string, clcmdchan chan<- *ClientCmd, frg *Frags, lassoes int, newc chan bool, tid time.Duration) {
 
     // a conn queue for lassoes
     cq := make(chan Conn, lassoes)
 
-    go connQueue(rLassoRtr, cq, newc, lassoes)
+    go connQueue(rLassoRtr, cq, newc, lassoes, time.Duration(frg.after), nil)
 
     // a throw for each connection
     for c := range cq {
         // reverse lassoes don't offer shooting because outgoing data is used for ack
-        go throwR(c, newc, clcmdchan, frg, tid)
+        go flingR(c, newc, clcmdchan, frg, tid)
     }
 }
 
-func throwR(c Conn, newc chan<- bool, cchan chan<- *ClientCmd, frg Frags, tid time.Duration) {
+func flingR(c Conn, newc chan<- bool, cchan chan<- *ClientCmd, frg *Frags, tid time.Duration) {
     var n int
     update := ClientCmd{
         cmd:    make([]byte, 1),
@@ -68,7 +72,7 @@ func throwR(c Conn, newc chan<- bool, cchan chan<- *ClientCmd, frg Frags, tid ti
 }
 
 // sends client commands to waiting reverse lasso connections
-func handleLassosR(c Conn, padRchan chan []byte) {
+func handleTunnelToTunnelR(c Conn, padRchan chan []byte) {
     // wait for a raw ClientCmd to write
     // log.Printf("got a reverse command")
     dst := <-padRchan
@@ -122,7 +126,7 @@ func dispatchRtr(shotsChan <-chan *Shot, padRchan chan []byte, connMap map[int64
 }
 
 // dispatchUDPClient function with retry support
-func dispatchUDPClientRtr(uchan <-chan *net.UDPConn, shotsChan <-chan *Shot, padRchan chan []byte ,
+func dispatchUDPClientRtr(uchan <-chan *net.UDPConn, shotsChan <-chan *Shot, padRchan chan []byte,
     clients map[string]*net.UDPAddr, clientOfsMap map[string]map[uint32]*Shot, mtx *sync.Mutex, skip int) {
     cofs := make(map[string]uint32) // holds the current seq of each connection
     rtMap := make(map[string]bool)  // holds the retries

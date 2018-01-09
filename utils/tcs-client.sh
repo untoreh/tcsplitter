@@ -6,7 +6,7 @@ REMOTE_IP=127.0.0.1
 proto=udp
 
 ./tcsplitter_amd64 \
-    --dup none \
+    --dup both \
     --fec 0 \
     --retries 0:1000 \
     --tick 1 \

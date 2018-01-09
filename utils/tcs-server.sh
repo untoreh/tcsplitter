@@ -19,11 +19,12 @@ proto=udp
     --lFling $REMOTE_IP:6091 \
     --rFling 0 \
     --lSync $REMOTE_IP:5998 \
-    --lLasso $REMOTE_IP:6899 \
+    --lLasso 0 \
     --rLasso 0 \
     --rFlingR 0 \
+    --lFlingR 0
+
+
     --lFlingR $REMOTE_IP:6989
-
-
-# --lLasso 0 \
+--lLasso $REMOTE_IP:6899 \
 

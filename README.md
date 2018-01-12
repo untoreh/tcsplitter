@@ -33,27 +33,28 @@ it could be tweaked to be equal to the number of `connections` received, since e
 
 ## Other options
 Most other options are not effectively functional at the moment.
-# fec
+### fec
 As in `datashards:parityshards` like `10:3`, to be considered when using a lot of connections resulting in ack timeouts and whatnot.
-# dup
+### dup
 Controls the direction of communication between tunnel ends.
 - `fling` (default), connections from client to server are used both for incoming and outgoing data in an asynchronous manner, meaning that connections which are always running timeout if no payloads are provided and new ones are established.
 - `lasso`, same as fling but lasso connections are used, this means the priority of the traffic is in favor of incoming data, *server -> client*
 - `both`, full duplex, fling and lasso mode together, for high interaction for both outgoing and incoming data.
 - `none`, simplex, connections only send data in one direction and are promptly closed afterwards.
-# protocol
+
+### protocol
 Tunnel TCP or UDP over TCP, currently only TCP effectively working.
-# after
+### after
 Warm up time in `ms` at the start of a connection, to complete handshakes and still being able to use high buffer times.
-# frags
+### frags
 As in `payloadSize:MTU`, how much data each connection carries in `bytes`. MTU not currently used.
-# conns/lassoes
+### conns/lassoes
 How many fling connections and lasso connections to keep open at any given time.
-# retries
+### retries
 As in `on/off:skippingRate`, the first value controls whether there should be attempts at retrasmitting lost payloads. This is best used in simplex mode (dup `none`) so that one end of the connection is used for acks. Otherwise the `sync` comm channel would be used to send retry requests. The `skippingRate` is instead best used with `fec` or when data integrity is not important in general as it simply skips over not available payloads after the specified number of attempts.
-# listen
+### listen
 The target where data is sent to, i.e. client/service.
-# lFling, rFling, lLasso, rLasso, lSync, rSync, lFlingR, rFlingR
+### lFling, rFling, lLasso, rLasso, lSync, rSync, lFlingR, rFlingR
 Respectively the addresses in form `IPv4:PORT` of the local and remote endpoints for flings, lassoes, clients status/data synchronizations and retries.
 
 ## Stuff left to try, polishing, optimizations

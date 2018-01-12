@@ -31,6 +31,8 @@ should be the same of the `buffer` of the other end. This should not be a requir
 if the second paramater of buffer, that is the number of payloads to buffer, would merge payloads, so that 
 it could be tweaked to be equal to the number of `connections` received, since each connection carries a payload.
 
+There are a couple of config file to be used on linux (`sysctl -p sysctl.dirty`) to test different setups, dirty means to saturate connections, clean to use as little as possible.
+
 ## Other options
 Most other options are not effectively functional at the moment.
 ### fec

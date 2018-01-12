@@ -116,13 +116,13 @@ func main() {
 		},
 		cli.StringFlag{
 			Name:        "tick",
-			Value:       "25",
+			Value:       "50",
 			Usage:       "unit of time to read a raw payload in milliseconds (50)",
 			Destination: &ti,
 		},
 		cli.StringFlag{
 			Name:        "tock",
-			Value:       "50",
+			Value:       "250",
 			Usage:       "timeout for merging raw payloads in milliseconds (250)",
 			Destination: &to,
 		},
@@ -670,7 +670,7 @@ func fling(dst []byte, fchan chan []byte, c Conn, newc chan<- bool, frg *Frags, 
 			cwClose(c, rw) // close conn
 			newc <- true   // req new conn
 			*(frg.avlc)--
-			log.Printf("scaled down avlc %v", *(frg.avlc))
+			// 			log.Printf("scaled down avlc %v", *(frg.avlc))
 			log.Printf("shot flung len: %v to %v", len(dst), c.LocalAddr())
 			return
 		case <-pubsub: // the lasso signaled to close connection
@@ -679,7 +679,7 @@ func fling(dst []byte, fchan chan []byte, c Conn, newc chan<- bool, frg *Frags, 
 			<-tochan       // respect rate limiter
 			newc <- true   // req new conn
 			*(frg.avlc)--
-			log.Printf("scaled down avlc %v", *(frg.avlc))
+			// 			log.Printf("scaled down avlc %v", *(frg.avlc))
 			// log.Printf("gave up fling")
 			return
 		}
@@ -714,7 +714,7 @@ func fling(dst []byte, fchan chan []byte, c Conn, newc chan<- bool, frg *Frags, 
 		difRef(dst, stuff, qcclo, cclo)
 	}
 	*(frg.avlc)--
-	log.Printf("scaled down avlc %v", *(frg.avlc))
+	// 	log.Printf("scaled down avlc %v", *(frg.avlc))
 	log.Printf("shot flung len: %v to %v", len(dst), c.LocalAddr())
 }
 
@@ -1010,7 +1010,7 @@ func dispatch(clients map[int64]bool, shotsChan <-chan *Shot, connMap map[int64]
 						bmap[ct] > frg.bs ||
 						!clients[ct] { // if enough shots are buffered or the connection has been closed
 						cOfsMap, failmap[ct] = forward(ct, cOfsMap, failmap[ct],
-							 clientOfsMap, connMap, bmap, fwmap[ct][0], skip, frg)
+							clientOfsMap, connMap, bmap, fwmap[ct][0], skip, frg)
 					}
 					mtx.Lock()
 				}
@@ -1287,14 +1287,14 @@ func tunnelPayloadsReader(cpchan chan<- Payload, c Conn, frg *Frags, fec Fec,
 				// default:
 				// log.Printf("avlc: %v", *(frg.avlc))
 				if *(frg.avlc) > 0 { // conns are available but respect timeout
-					log.Printf("TPR: non-full payload goes to channel")
+					// log.Printf("TPR: non-full payload goes to channel")
 					cpchan <- payload
 				} else { // if no conns are avl then keep merging until max size
 					if payload.ln < frg.payload {
-						log.Printf("TPR: go to label")
+						// log.Printf("TPR: go to label")
 						goto rTP
 					} else {
-						log.Printf("TPR: full payload goes to channel")
+						// log.Printf("TPR: full payload goes to channel")
 						cpchan <- payload
 					}
 				}
@@ -1439,7 +1439,7 @@ func writeDup(dup bool, c Conn, conns int, frg *Frags,
 			c.Write(stuff) // dumb write
 			cwClose(c, rw)
 			*(frg.avlc)--
-			log.Printf("scaled down avlc %v", *(frg.avlc))
+			// 			log.Printf("scaled down avlc %v", *(frg.avlc))
 			return
 		}
 		// log.Printf("writing to flinged conn")
@@ -1459,7 +1459,7 @@ func writeDup(dup bool, c Conn, conns int, frg *Frags,
 		c.Close()
 	}
 	*(frg.avlc)--
-	log.Printf("scaled down avlc %v", *(frg.avlc))
+	// 	log.Printf("scaled down avlc %v", *(frg.avlc))
 }
 
 func qShot(shot []byte, ch chan<- []byte) {

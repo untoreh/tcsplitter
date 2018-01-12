@@ -58,6 +58,8 @@ As in `on/off:skippingRate`, the first value controls whether there should be at
 The target where data is sent to, i.e. client/service.
 ### lFling, rFling, lLasso, rLasso, lSync, rSync, lFlingR, rFlingR
 Respectively the addresses in form `IPv4:PORT` of the local and remote endpoints for flings, lassoes, clients status/data synchronizations and retries.
+### burst
+This is hardcoded off by default. In this mode there should a fixed based number of connections, plus room to ramp up the number when the payloads queue gets long.
 
 ## Stuff left to try, polishing, optimizations
 See issues.

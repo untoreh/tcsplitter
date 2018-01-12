@@ -72,5 +72,6 @@ Kind of outdated at this point.
 ## Dependencies 
 
 - [urfave/cli](https://github.com/urfave/cli)
-- [dscp]
-- [...]
+- [aristanetworks/goarista/dscp](https://github.com/aristanetworks/goarista/dscp)
+- [klauspost/reedsolomon](https://github.com/klauspost/reedsolomon)
+- [tevino/abool](https://github.com/tevino/abool)

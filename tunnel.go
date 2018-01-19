@@ -453,6 +453,28 @@ func flingServer(errchan chan<- error, addr *string, rfchan chan<- *Shot, padcha
 
 }
 
+func flingListener(errchan chan<- error, addr *string, rfchan chan<- *Shot, padchan chan []byte,
+	frg *Frags, conns int, tid time.Duration, dup *string, prctl *string, fschan chan bool, stuff []byte){
+	addrTCP, _ := net.ResolveTCPAddr("tcp", *addr)
+	// ln, err := net.ListenTCP("tcp", addrTCP)
+	ln, err := dscp.ListenTCPWithTOS(addrTCP, frg.tos)
+	if err != nil {
+		errchan <- err
+	}
+
+	for {
+		conn, err := ln.AcceptTCP()
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+		*(frg.avlc)++
+		// log.Printf("handling a received fling, %v", *(frg.avlc))
+		go handleTunnelToTunnel(prctl, conn, rfchan, padchan, frg, conns,
+			fschan, tid, defDup(dup), stuff)
+	}
+}
+
 func defDup(dup *string) bool {
 	switch *dup {
 	case "both", "lasso", "fling":
@@ -520,14 +542,16 @@ func dialTCP(addr *net.TCPAddr) Conn {
 	return c
 }
 
-func rampConns(addrTCP *net.TCPAddr, st int, cq chan<- Conn, t time.Duration) {
+func rampConns(addrTCP *net.TCPAddr, st int, cq chan<- Conn, t time.Duration, avlc *int) {
 	cn := 0
 	time.Sleep(t)
 	for cn < st {
 		go func(chan<- Conn) {
-			// c, err := net.DialTCP("tcp", nil, addrTCP)
-			cq <- dialTCP(addrTCP)
-
+			c := *new(Conn)
+			for c = nil; c == nil; c = dialTCP(addrTCP) {
+			} // log.Printf("increased avlc %v
+			cq <- c
+			*avlc++ // a new conn is avl
 		}(cq)
 		cn++
 	}
@@ -539,19 +563,26 @@ func connQueue(addr *string, cq chan<- Conn, newc <-chan bool, st int, start tim
 	addrTCP, _ := net.ResolveTCPAddr("tcp", *addr)
 
 	// start with just one connection
-	cq <- dialTCP(addrTCP)
-	*avlc++
+	if c := dialTCP(addrTCP); c != nil {
+		cq <- c
+		*avlc++
+	} else {
+		log.Fatalf("couldn't dial initial connection to %v", addrTCP.String())
+	}
 	// start the rest of the connections after startup
-	go rampConns(addrTCP, st, cq, start)
+	go rampConns(addrTCP, st, cq, start, avlc)
 
 	for range newc {
 		// log.Printf("go new conn to %v", *addr)
 		go func() {
 			// c, err := net.DialTCP("tcp", nil, addrTCP)
 			// time.Sleep(100 * time.Duration(len(cq)) * time.Millisecond)
-			cq <- dialTCP(addrTCP)
+			// log.Printf("increased avlc %v
+			c := *new(Conn)
+			for c = nil; c == nil; c = dialTCP(addrTCP) {
+			} // log.Printf("increased avlc %v
+			cq <- c
 			*avlc++ // a new conn is avl
-			// log.Printf("increased avlc %v", *avlc)
 		}()
 	}
 }
@@ -668,21 +699,20 @@ func fling(dst []byte, fchan chan []byte, c Conn, newc chan<- bool, frg *Frags, 
 				qShot(dst, fchan)
 			}
 			cwClose(c, rw) // close conn
-			newc <- true   // req new conn
 			*(frg.avlc)--
-			// 			log.Printf("scaled down avlc %v", *(frg.avlc))
-			log.Printf("shot flung len: %v to %v", len(dst), c.LocalAddr())
-			return
+			// log.Printf("fling dst: scaled down avlc %v
+			newc <- true   // req new conn
+			// log.Printf("shot flung len: %v to %v", len(dst), c.LocalAddr())
 		case <-pubsub: // the lasso signaled to close connection
 			c.Write(stuff) // dumbwrite
 			cwClose(c, rw) // close conn
-			<-tochan       // respect rate limiter
-			newc <- true   // req new conn
 			*(frg.avlc)--
-			// 			log.Printf("scaled down avlc %v", *(frg.avlc))
+			// <-tochan       // respect rate limiter
+			// log.Printf("scaled down avlc %v", *(frg.avlc))
+			newc <- true // req new conn
 			// log.Printf("gave up fling")
-			return
 		}
+		return
 	}
 
 	cclo := func() { c.Close() }         // full close
@@ -714,8 +744,8 @@ func fling(dst []byte, fchan chan []byte, c Conn, newc chan<- bool, frg *Frags, 
 		difRef(dst, stuff, qcclo, cclo)
 	}
 	*(frg.avlc)--
-	// 	log.Printf("scaled down avlc %v", *(frg.avlc))
-	log.Printf("shot flung len: %v to %v", len(dst), c.LocalAddr())
+	// log.Printf("fling end: scaled down avlc %v
+	// log.Printf("shot flung len: %v to %v", len(dst), c.LocalAddr())
 }
 
 // compare reference of slices
@@ -1068,7 +1098,7 @@ func forward(ct int64, cofs map[int64]uint32, fail int, clientOfsMap map[int64]m
 					return cofs, fail
 				}
 				// shot was written jump to the next
-				// log.Printf("forwarding successful, ofs: %v, seq: %v", intBytes(shot.ofs), intBytes(shot.seq))
+				log.Printf("forwarding successful, ofs: %v, seq: %v", intBytes(shot.ofs), intBytes(shot.seq))
 				delete(clientOfsMap[ct], cofs[ct]) // clear the forwarded shot, loop again
 				bmap[ct]--                         // decrease queued shots counter
 				cofs[ct] = intBytes(shot.seq)
@@ -1092,7 +1122,7 @@ func forward(ct int64, cofs map[int64]uint32, fail int, clientOfsMap map[int64]m
 					return cofs, fail
 				}
 				// shot was written jump to the next
-				// log.Printf("forwarding successful, ofs: %v, seq: %v", intBytes(shot.ofs), intBytes(shot.seq))
+				// log.Printf("skip: forwarding successful, ofs: %v, seq: %v", intBytes(shot.ofs), intBytes(shot.seq))
 				delete(clientOfsMap[ct], cofs[ct]) // clear the forwarded shot, loop again
 				bmap[ct]--                         // reduce queued shots counter
 				cofs[ct] = intBytes(shot.seq)
@@ -1101,7 +1131,7 @@ func forward(ct int64, cofs map[int64]uint32, fail int, clientOfsMap map[int64]m
 				break  // wait for next dispatch
 			}
 		default:
-			log.Printf("not forwarding..")
+			// log.Printf("not forwarding..")
 			return cofs, fail
 		}
 	}
@@ -1117,7 +1147,6 @@ func nextAvl(ofsMap map[uint32]*Shot, ofs uint32, frg uint32, ps uint32) (uint32
 		if _, avl = ofsMap[ofs]; avl {
 			return ofs, true
 		}
-		log.Printf("nopee")
 		ofs += frg
 	}
 	return 0, false
@@ -1268,24 +1297,14 @@ func tunnelPayloadsReader(cpchan chan<- Payload, c Conn, frg *Frags, fec Fec,
 			payload := Payload{
 				data: make([]byte, frg.payload),
 			}
-			log.Printf("reading tunnel payload")
+			// log.Printf("reading tunnel payload")
 		rTP:
 			payload.ln, e = readTunnelPayload(c, payload.data, payload.ln, frg.payload,
 				tichan[0], tochan[0], tid, tod)
-			log.Printf("read tunnel payload %v", payload.ln)
+			// log.Printf("read tunnel payload %v", payload.ln)
 			if e != nil && payload.ln == 0 {
 				break
 			} else {
-				// select {
-				// case <-acchan: // notification about new conn
-				// cpchan <- payload
-				// keep stacking payloads (still respecting max size) if no connections are avail
-				// default:
-				// select {
-				// case <-tochan[0]: // respect the timeout
-				// cpchan <- payload
-				// default:
-				// log.Printf("avlc: %v", *(frg.avlc))
 				if *(frg.avlc) > 0 { // conns are available but respect timeout
 					// log.Printf("TPR: non-full payload goes to channel")
 					cpchan <- payload
@@ -1336,9 +1355,9 @@ func handleClientToTunnel(c Conn, fchan chan<- []byte,
 	seq := uint32(0)
 	cl.seq <- seq
 	for {
-		log.Printf("before payload")
+		// log.Printf("before payload")
 		payload, open := <-pcchan
-		log.Printf("after payload")
+		// log.Printf("after payload")
 		// this check is necessary otherwise the handler never stops when a client disconnects
 		// leaving the connection data lingering
 		if !open && payload.ln == 0 {
@@ -1413,7 +1432,7 @@ func readShot(shot *Shot, c Conn, frg *Frags, tid time.Duration, rfchan chan<- *
 	// log.Printf("read payload from tunnel conn")
 	shot.ln = uint32(n)
 	rfchan <- shot
-	log.Printf("channeled shot from tunnel conn to service")
+	// log.Printf("channeled shot from tunnel conn to service ofs %v, seq %v", intBytes(shot.ofs), intBytes(shot.seq))
 	return crClose(c, rw) // either CloseRead or fully Close
 }
 
@@ -1434,12 +1453,12 @@ func writeDup(dup bool, c Conn, conns int, frg *Frags,
 		var dst []byte
 		select {
 		case dst = <-padchan:
-		case <-time.After(frg.bt):
+		case <-time.After(frg.bt * 3):
 			// log.Printf("no shots for now...closing (srv) %v", c.LocalAddr())
 			c.Write(stuff) // dumb write
 			cwClose(c, rw)
 			*(frg.avlc)--
-			// 			log.Printf("scaled down avlc %v", *(frg.avlc))
+			// log.Printf("writeDup: scaled down avlc %v
 			return
 		}
 		// log.Printf("writing to flinged conn")
@@ -1459,7 +1478,7 @@ func writeDup(dup bool, c Conn, conns int, frg *Frags,
 		c.Close()
 	}
 	*(frg.avlc)--
-	// 	log.Printf("scaled down avlc %v", *(frg.avlc))
+	// log.Printf("writeDup end: scaled down avlc %v
 }
 
 func qShot(shot []byte, ch chan<- []byte) {
@@ -1545,7 +1564,7 @@ func handleLasso(padchan chan []byte, c Conn, rfchan chan *Shot, frg *Frags, tid
 		log.Printf("failed writing shot of len %v to lasso", len(dst))
 		go qShot(dst, padchan)
 	} else {
-		log.Printf("wrote a shot of len %v to lasso", len(dst))
+		// log.Printf("wrote a shot of len %v to lasso", len(dst))
 	}
 
 }
@@ -1949,6 +1968,7 @@ func sendClientUpdate(update *ClientCmd, rSyncAddr *net.TCPAddr, padRchan chan<-
 		}
 		log.Printf("remote ack successfull")
 	} else { // else we just queue the raw command to be managed by the lasso handler
+		log.Printf("queing up the sync notification into padRchan")
 		padRchan <- dst
 	}
 
@@ -2016,7 +2036,7 @@ func clearConn(prctl string, clients interface{}, ccon interface{},
 		// wait until the last shot has been forwarded
 		log.Printf("clearing the conn for %v", ct)
 		cSeq := cOfsMap[ct]
-		for tries := 0; cSeq != seq && seq != 0 && clients[ct] && tries < 60; tries++ { // try 60 times ~ 1 minute
+		for tries := 0; cSeq != seq && seq != 0 && clients[ct] && tries < 5; tries++ { // try 60 times ~ 1 minute
 			log.Printf("waiting to delete the client: seq %v, cSeq %v", seq, cSeq)
 			time.Sleep(1 * time.Second)
 			cSeq = cOfsMap[ct]
@@ -2132,6 +2152,7 @@ func readTunnelPayload(c Conn, pl []byte, tn int, pll int,
 		c.SetReadDeadline(time.Time{}) // reset the deadline for the first read
 	} else {
 		c.SetReadDeadline(time.Now().Add(tod))
+		// log.Printf("reading payload with a deadline")
 	}
 	// log.Printf("reading the first")
 	n, e = c.Read(pl[tn:])
@@ -2147,19 +2168,20 @@ func readTunnelPayload(c Conn, pl []byte, tn int, pll int,
 		case <-tichan:
 			// tn is never 0 here
 			c.SetReadDeadline(time.Now().Add(tod))
-			// log.Printf("reading from client")
+			// log.Printf("for: reading payload until max size or tock")
 			n, e = c.Read(pl[tn:])
-			// log.Printf("read from client %v", n)
+			// log.Printf("for: read from %v", n)
 			if !ckRead(n, e) {
 				return tn, e
 			}
 			tn += n
 		case <-tochan:
-			// log.Printf("returning from tock")
+			// log.Printf("for: returning from tock")
 			return tn, nil
 		}
 	}
 	<-tochan // make sure we wait at least a tock
+	// log.Printf("returning at the end of payload")
 	return tn, nil
 }
 

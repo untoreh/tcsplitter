@@ -31,8 +31,9 @@ should be the same of the `buffer` of the other end. This should not be a requir
 if the second paramater of buffer, that is the number of payloads to buffer, would merge payloads, so that 
 it could be tweaked to be equal to the number of `connections` received, since each connection carries a payload.
 
-There are a couple of config file to be used on linux (`sysctl -p sysctl.dirty`) to test different setups, dirty means to saturate connections, clean to use as little as possible.
+There are a couple of config file to be used on linux (`sysctl -p sysctl.dirty`) to test different setups, dirty means to saturate connections/sockets, clean to use as little as possible.
 
+Note: for long data streams on slow networks, the server might need a buffer time lower than the client *(0.5<bt<1)* to avoid falling behind the stream, this happens because the data is forwarded according to the value of `bt` but since payloads might be late, steps might be skipped but there is no *fast-forward* (intentionally), this to make stable video data streams with less buffering spikes. Adding a catchup version for forwarding is also trivial.
 ## Other options
 Most other options are not effectively functional at the moment.
 ### fec

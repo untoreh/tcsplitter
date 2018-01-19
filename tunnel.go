@@ -104,7 +104,7 @@ func main() {
 		},
 		cli.StringFlag{
 			Name:        "after",
-			Value:       "2000",
+			Value:       "0",
 			Usage:       "for handshakes, start buffering only after (0)ms",
 			Destination: &after,
 		},
@@ -140,7 +140,7 @@ func main() {
 		},
 		cli.StringFlag{
 			Name:        "retries",
-			Value:       "0:4",
+			Value:       "0:-1",
 			Usage:       "enable synced retries and tune skipping rate (0:conns)",
 			Destination: &retries,
 		},
@@ -152,13 +152,13 @@ func main() {
 		},
 		cli.StringFlag{
 			Name:        "lFling",
-			Value:       "127.0.0.1:6090",
+			Value:       "0",
 			Usage:       "local listening address for peers (127.0.0.1:6090)",
 			Destination: &lFling,
 		},
 		cli.StringFlag{
 			Name:        "rFling",
-			Value:       "127.0.0.1:6091",
+			Value:       "0",
 			Usage:       "address to send outgoing connections, a lFling of another peer (127.0.0.1:6091)",
 			Destination: &rFling,
 		},
@@ -194,7 +194,7 @@ func main() {
 		},
 		cli.StringFlag{
 			Name:        "lSync",
-			Value:       "127.0.0.1:5999",
+			Value:       "0",
 			Usage:       "address for listening to status syncronizations (127.0.0.1:5999)",
 			Destination: &lSync,
 		},
@@ -309,7 +309,9 @@ func main() {
 
 			go throttle(tichan, tid)
 			go throttle(tochan, tod)
-			go syncServer(errchan, &lSync, clcmdchan)
+			if lSync != "0" {
+				go syncServer(errchan, &lSync, clcmdchan)
+			}
 			go clientServer(errchan, &listen, fchan, rtr, rtmap, schan, addchan, rmchan,
 				&frg, fecConf, conns, tichan, tochan, tid, tod)
 			go syncHandler(addchan, rmchan, &rSync, clients, frmap, flmap, clcmdchan, ccon,
@@ -350,7 +352,9 @@ func main() {
 			// channel for the single connection of the udp listener
 			uchan := make(chan *net.UDPConn)
 
-			go syncServerUDP(errchan, &lSync, clients, clcmdchan)
+			if lSync != "0" {
+				go syncServerUDP(errchan, &lSync, clients, clcmdchan)
+			}
 			go clientServerUDP(errchan, &listen, fchan,
 				rtr, rtmap, schan,
 				addchan, rmchan, clients, uchan,
@@ -432,36 +436,22 @@ func flingServer(errchan chan<- error, addr *string, rfchan chan<- *Shot, padcha
 	// a dumb byte array for late writes
 	stuff := make([]byte, 10)
 
-	addrTCP, _ := net.ResolveTCPAddr("tcp", *addr)
-	// ln, err := net.ListenTCP("tcp", addrTCP)
-	ln, err := dscp.ListenTCPWithTOS(addrTCP, frg.tos)
-	if err != nil {
-		errchan <- err
-	}
-
-	for {
-		conn, err := ln.AcceptTCP()
-		if err != nil {
-			log.Println(err)
-			continue
-		}
-		*(frg.avlc)++
-		// log.Printf("handling a received fling, %v", *(frg.avlc))
-		go handleTunnelToTunnel(prctl, conn, rfchan, padchan, frg, conns,
-			fschan, tid, defDup(dup), stuff)
-	}
-
+	go flingListener(errchan, addr, rfchan, padchan, frg, conns, tid, dup, prctl, fschan, stuff)
+	// for p := 10901; p < 10925; p++ {
+	// addrp := "212.237.6.194:"+strconv.Itoa(p)
+	// go flingListener(errchan, &addrp, rfchan, padchan, frg, conns, tid, dup, prctl, fschan, stuff)
+	// }
 }
 
 func flingListener(errchan chan<- error, addr *string, rfchan chan<- *Shot, padchan chan []byte,
-	frg *Frags, conns int, tid time.Duration, dup *string, prctl *string, fschan chan bool, stuff []byte){
+	frg *Frags, conns int, tid time.Duration, dup *string, prctl *string, fschan chan bool, stuff []byte) {
 	addrTCP, _ := net.ResolveTCPAddr("tcp", *addr)
 	// ln, err := net.ListenTCP("tcp", addrTCP)
 	ln, err := dscp.ListenTCPWithTOS(addrTCP, frg.tos)
 	if err != nil {
 		errchan <- err
 	}
-
+	// log.Printf("listening on %v", ln.Addr())
 	for {
 		conn, err := ln.AcceptTCP()
 		if err != nil {
@@ -469,7 +459,7 @@ func flingListener(errchan chan<- error, addr *string, rfchan chan<- *Shot, padc
 			continue
 		}
 		*(frg.avlc)++
-		// log.Printf("handling a received fling, %v", *(frg.avlc))
+		// log.Printf("handling a received fling, %v", conn.LocalAddr())
 		go handleTunnelToTunnel(prctl, conn, rfchan, padchan, frg, conns,
 			fschan, tid, defDup(dup), stuff)
 	}
@@ -577,7 +567,7 @@ func connQueue(addr *string, cq chan<- Conn, newc <-chan bool, st int, start tim
 		go func() {
 			// c, err := net.DialTCP("tcp", nil, addrTCP)
 			// time.Sleep(100 * time.Duration(len(cq)) * time.Millisecond)
-			// log.Printf("increased avlc %v
+
 			c := *new(Conn)
 			for c = nil; c == nil; c = dialTCP(addrTCP) {
 			} // log.Printf("increased avlc %v
@@ -609,6 +599,10 @@ func flinger(fchan chan []byte, rFling *string, cq chan Conn, newc chan bool,
 
 	// set up connections pool
 	go connQueue(rFling, cq, newc, st, time.Duration(frg.after), frg.avlc)
+	// for p := 10901; p < 10925; p++ {
+	// addr := "212.237.6.194:"+strconv.Itoa(p)
+	// go connQueue(&addr, cq, newc, st, time.Duration(frg.after), frg.avlc)
+	// }
 
 	stuff := make([]byte, 10)
 	flingAndLasso := func(f []byte, c Conn, rw *abool.AtomicBool,
@@ -700,9 +694,9 @@ func fling(dst []byte, fchan chan []byte, c Conn, newc chan<- bool, frg *Frags, 
 			}
 			cwClose(c, rw) // close conn
 			*(frg.avlc)--
-			// log.Printf("fling dst: scaled down avlc %v
-			newc <- true   // req new conn
-			// log.Printf("shot flung len: %v to %v", len(dst), c.LocalAddr())
+			// log.Printf("fling dst: scaled down avlc %v", *(frg.avlc))
+			newc <- true // req new conn
+			// log.Printf("shot flung len: %v to %v", len(dst), c.RemoteAddr())
 		case <-pubsub: // the lasso signaled to close connection
 			c.Write(stuff) // dumbwrite
 			cwClose(c, rw) // close conn
@@ -1033,6 +1027,7 @@ func dispatch(clients map[int64]bool, shotsChan <-chan *Shot, connMap map[int64]
 			// a default is needed because the forward func can choose to not write any data if a buffer time is set
 		case <-time.After(frg.bt):
 			if len(cOfsMap) > 0 {
+				// log.Printf("forwarding remaining shots because no more shots were received...")
 				mtx.Lock()                // the unlock is within the range which runs for sure because len>0
 				for ct := range cOfsMap { // loop over each client to forward remaining shots
 					mtx.Unlock()
@@ -1098,7 +1093,7 @@ func forward(ct int64, cofs map[int64]uint32, fail int, clientOfsMap map[int64]m
 					return cofs, fail
 				}
 				// shot was written jump to the next
-				log.Printf("forwarding successful, ofs: %v, seq: %v", intBytes(shot.ofs), intBytes(shot.seq))
+				// log.Printf("forwarding successful, ofs: %v, seq: %v", intBytes(shot.ofs), intBytes(shot.seq))
 				delete(clientOfsMap[ct], cofs[ct]) // clear the forwarded shot, loop again
 				bmap[ct]--                         // decrease queued shots counter
 				cofs[ct] = intBytes(shot.seq)
@@ -1127,6 +1122,7 @@ func forward(ct int64, cofs map[int64]uint32, fail int, clientOfsMap map[int64]m
 				bmap[ct]--                         // reduce queued shots counter
 				cofs[ct] = intBytes(shot.seq)
 			} else {
+				// log.Printf("shot not ready")
 				fail++ // increase failed forwarding attempts
 				break  // wait for next dispatch
 			}
@@ -1297,8 +1293,8 @@ func tunnelPayloadsReader(cpchan chan<- Payload, c Conn, frg *Frags, fec Fec,
 			payload := Payload{
 				data: make([]byte, frg.payload),
 			}
-			// log.Printf("reading tunnel payload")
 		rTP:
+			// log.Printf("reading tunnel payload")
 			payload.ln, e = readTunnelPayload(c, payload.data, payload.ln, frg.payload,
 				tichan[0], tochan[0], tid, tod)
 			// log.Printf("read tunnel payload %v", payload.ln)
@@ -1420,7 +1416,7 @@ func handleTunnelToTunnel(prctl *string, c Conn, rfchan chan<- *Shot, padchan ch
 
 func readShot(shot *Shot, c Conn, frg *Frags, tid time.Duration, rfchan chan<- *Shot, rw *abool.AtomicBool) bool {
 	var n int
-	// log.Printf("reading shot fields from tunnel conn")
+	// log.Printf("reading shot fields from tunnel conn %v", c.LocalAddr())
 	if !readShotFieldsNoQ(c, [3][]byte{shot.client, shot.ofs, shot.seq}) {
 		// check wheter to fully close the connection
 		return crClose(c, rw)
@@ -1432,7 +1428,7 @@ func readShot(shot *Shot, c Conn, frg *Frags, tid time.Duration, rfchan chan<- *
 	// log.Printf("read payload from tunnel conn")
 	shot.ln = uint32(n)
 	rfchan <- shot
-	// log.Printf("channeled shot from tunnel conn to service ofs %v, seq %v", intBytes(shot.ofs), intBytes(shot.seq))
+	// log.Printf("channeled shot from tunnel conn %v to service ofs %v, seq %v", c.LocalAddr(), intBytes(shot.ofs), intBytes(shot.seq))
 	return crClose(c, rw) // either CloseRead or fully Close
 }
 

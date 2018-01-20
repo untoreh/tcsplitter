@@ -1,7 +1,9 @@
 #!/bin/sh -x
 
-REMOTE_USER=root
-REMOTE_IP=212.237.6.194
+REMOTE_USER=${REMOTE:-root}
+# REMOTE_IP=212.237.6.194
+REMOTE_IP=${REMOTE_IP:-88.198.69.215}
+REMOTE_PORT=${REMOTE_PORT:-19021}
 REMOTE_PATH=/root/tcsplitter
 ANDROID=true ## push to phone
 # ANDROID_DEVICE="-s 192.168.42.129:5555"
@@ -9,7 +11,7 @@ ANDROID_PATH=/data/alpine/tcsplitter
 
 if [ -z "$LOCAL" ]; then
 	go build --ldflags '-s -w' -buildmode=exe -o out/tcsplitter_amd64 ./*.go
-	scp -r out/tcsplitter_amd64 $REMOTE_USER@$REMOTE_IP:$REMOTE_PATH &
+	scp -r -P22 -P${REMOTE_PORT} out/tcsplitter_amd64 $REMOTE_USER@$REMOTE_IP:$REMOTE_PATH &
 fi
 
 if [ $ANDROID = true ]; then

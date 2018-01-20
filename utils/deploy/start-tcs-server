@@ -1,0 +1,52 @@
+#!/bin/sh
+
+## daemon conf on alpine
+## copy tmux over to /etc/tmux.conf and add tmux.start to /etc/local.d (alpine)
+## rc-update add local defaults
+
+# listenip=10.10.12.209
+# listenip=localhost
+listenip=172.16.0.190
+pl=1292
+mtu=1308
+# pl=11756 # (+16)
+# pl=8000
+# pl=500
+conns=12
+bt=$((1000/conns/2))
+to=$bt
+ti=$((bt/2))
+# proto=udp
+
+#fling_port=80
+fling_port=19001
+# lasso_port=80
+# rfling_port=20901
+sync_port=19002
+listen_port=6001
+
+# forward="live-mil.twitch.tv:1935"
+# forward="live-fra.twitch.tv:1935"
+forward=localhost:22
+
+start(){
+    if [ "$1" = daemon ]; then
+        shift
+        while true; do
+            "$@"
+        done
+    else
+        exec "$@"
+    fi
+}
+
+start $1 tcsplitter \
+      --frags $pl:$mtu \
+      --conns $conns \
+      --buffer $bt:0 \
+      --tick $ti \
+      --tock $to \
+      --listen $listenip:$listen_port \
+      --forward $forward \
+      --lFling $listenip:$fling_port \
+      --lSync $listenip:$sync_port

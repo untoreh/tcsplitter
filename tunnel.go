@@ -1951,7 +1951,7 @@ func sendClientUpdate(update *ClientCmd, rSyncAddr *net.TCPAddr, padRchan chan<-
 		(*c).CloseWrite()
 		(*c).SetReadDeadline(time.Now().Add(5 * time.Second))
 		log.Printf("waiting for remote ack")
-		for !rcvack(c) { // retry until the update has been ack
+		for !rcvack(c, 10) { // retry until the update has been ack
 			//log.Printf("retrying ack")
 			// c, err = net.DialTCP("tcp", nil, rSyncAddr)
 			for err = nil; c == nil || err != nil; c, err = dscp.DialTCPWithTOS(nil, rSyncAddr, tos) {
@@ -1961,6 +1961,7 @@ func sendClientUpdate(update *ClientCmd, rSyncAddr *net.TCPAddr, padRchan chan<-
 			(*c).Write(dst)
 			(*c).CloseWrite()
 			(*c).SetReadDeadline(time.Now().Add(15 * time.Second))
+			time.Sleep(time.Second)
 		}
 		log.Printf("remote ack successfull")
 	} else { // else we just queue the raw command to be managed by the lasso handler
@@ -1985,23 +1986,23 @@ func sndack(c *net.TCPConn, pls int) bool {
 		ret++
 		//log.Printf("error sending ack: %v, retry %v", e, ret)
 	}
-	if ret > 0 {
+	if ret > 3 {
 		log.Printf("failed sending ack")
 		c.CloseWrite()
 		c.Close()
 		return false
 	}
-	//log.Printf("sent ack")
+	// log.Printf("sent ack")
 	c.CloseWrite() // ack is after a read so we always close
 	c.Close()
 	return true
 }
 
 // receive ack
-func rcvack(c Conn) bool {
+func rcvack(c Conn, pls int) bool {
 	ack := make([]byte, 1)
 	n, err := c.Read(ack)
-	if n != 1 && err != nil && err != io.EOF {
+	if n != pls && err != io.EOF {
 		log.Printf("ack failed n: %v, err: %v", n, err)
 		(*c).CloseRead()
 		return false

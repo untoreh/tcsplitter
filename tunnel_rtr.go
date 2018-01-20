@@ -83,7 +83,7 @@ func handleTunnelToTunnelR(c Conn, padRchan chan []byte) {
         //log.Printf("reverse lasso: wrote a command %v, ofs %v", update.cmd, intBytes(update.data))
         (*c).CloseWrite()
         (*c).SetReadDeadline(time.Now().Add(10 * time.Second))
-        if !rcvack(c) { // if ack failed requeue the command for another reverse lasso
+        if !rcvack(c, 10) { // if ack failed requeue the command for another reverse lasso
             padRchan <- dst
         }
     }
